@@ -303,14 +303,18 @@ async function preflight() {
   // forward running.  If a NemoClaw-owned gateway is still present, tear
   // it down so the port check below doesn't fail on our own leftovers.
   const gwInfo = runCapture("openshell gateway info -g nemoclaw 2>/dev/null", { ignoreError: true });
-  if (hasStaleGateway(gwInfo)) {
+  const gwConnected = runCapture("openshell status 2>&1", { ignoreError: true }).includes("Connected");
+  if (hasStaleGateway(gwInfo) && !gwConnected) {
+    // Only destroy if the gateway is not healthy — destroying a connected
+    // gateway would kill all running sandboxes.
     console.log("  Cleaning up previous NemoClaw session...");
     run("openshell gateway destroy -g nemoclaw 2>/dev/null || true", { ignoreError: true });
     console.log("  ✓ Previous session cleaned up");
   }
 
-  // Required ports — gateway (8080) only; dashboard port is allocated dynamically per sandbox
-  const requiredPorts = [
+  // Skip port 8080 check when our gateway is already running — it owns that port.
+  // Dashboard port is allocated dynamically per sandbox (no fixed port to check).
+  const requiredPorts = gwConnected ? [] : [
     { port: 8080, label: "OpenShell gateway" },
   ];
   for (const { port, label } of requiredPorts) {
@@ -362,7 +366,14 @@ async function preflight() {
 async function startGateway(gpu) {
   step(2, 7, "Starting OpenShell gateway");
 
-  // Destroy old gateway
+  // Reuse the gateway if it is already healthy — destroying it would kill all sandboxes.
+  const existingStatus = runCapture("openshell status 2>&1", { ignoreError: true });
+  if (existingStatus.includes("Connected")) {
+    console.log("  ✓ Gateway already running — reusing existing gateway");
+    return;
+  }
+
+  // No healthy gateway — destroy any stale remnant and start fresh.
   run("openshell gateway destroy -g nemoclaw 2>/dev/null || true", { ignoreError: true });
 
   const gwArgs = ["--name", "nemoclaw"];
@@ -747,7 +758,7 @@ async function setupInference(sandboxName, model, provider) {
     run(
       `openshell provider create --name vllm-local --type openai ` +
       `--credential "OPENAI_API_KEY=dummy" ` +
-      `--config "OPENAI_BASE_URL=${baseUrl}" 2>&1 || ` +
+      `--config "OPENAI_BASE_URL=${baseUrl}" 2>/dev/null || ` +
       `openshell provider update vllm-local --credential "OPENAI_API_KEY=dummy" ` +
       `--config "OPENAI_BASE_URL=${baseUrl}" 2>&1 || true`,
       { ignoreError: true }
@@ -767,7 +778,7 @@ async function setupInference(sandboxName, model, provider) {
     run(
       `openshell provider create --name ollama-local --type openai ` +
       `--credential "OPENAI_API_KEY=ollama" ` +
-      `--config "OPENAI_BASE_URL=${baseUrl}" 2>&1 || ` +
+      `--config "OPENAI_BASE_URL=${baseUrl}" 2>/dev/null || ` +
       `openshell provider update ollama-local --credential "OPENAI_API_KEY=ollama" ` +
       `--config "OPENAI_BASE_URL=${baseUrl}" 2>&1 || true`,
       { ignoreError: true }
