@@ -305,15 +305,13 @@ async function preflight() {
   const gwInfo = runCapture("openshell gateway info -g nemoclaw 2>/dev/null", { ignoreError: true });
   if (hasStaleGateway(gwInfo)) {
     console.log("  Cleaning up previous NemoClaw session...");
-    run("openshell forward stop 18789 2>/dev/null || true", { ignoreError: true });
     run("openshell gateway destroy -g nemoclaw 2>/dev/null || true", { ignoreError: true });
     console.log("  ✓ Previous session cleaned up");
   }
 
-  // Required ports — gateway (8080) and dashboard (18789)
+  // Required ports — gateway (8080) only; dashboard port is allocated dynamically per sandbox
   const requiredPorts = [
     { port: 8080, label: "OpenShell gateway" },
-    { port: 18789, label: "NemoClaw dashboard" },
   ];
   for (const { port, label } of requiredPorts) {
     const portCheck = await checkPortAvailable(port);
@@ -429,17 +427,23 @@ async function createSandbox(gpu) {
         console.error("  Set NEMOCLAW_RECREATE_SANDBOX=1 to recreate it in non-interactive mode.");
         process.exit(1);
       }
-      console.log(`  [non-interactive] Sandbox '${sandboxName}' exists — recreating`);
+      console.log(`  [non-interactive] Sandbox '${sandboxName}' exists — recreating (port ${existing.chatPort || 18789} will be reassigned)`);
     } else {
       const recreate = await prompt(`  Sandbox '${sandboxName}' already exists. Recreate? [y/N]: `);
       if (recreate.toLowerCase() !== "y") {
         console.log("  Keeping existing sandbox.");
-        return sandboxName;
+        return { sandboxName, chatPort: existing.chatPort || 18789 };
       }
     }
     // Destroy old sandbox
     run(`openshell sandbox delete "${sandboxName}" 2>/dev/null || true`, { ignoreError: true });
     registry.removeSandbox(sandboxName);
+  }
+
+  // Allocate a unique host port for this sandbox's dashboard
+  let chatPort = registry.allocateChatPort();
+  while (!(await checkPortAvailable(chatPort)).ok) {
+    chatPort += 1;
   }
 
   // Stage build context
@@ -463,8 +467,8 @@ async function createSandbox(gpu) {
   // --gpu is intentionally omitted. See comment in startGateway().
 
   console.log(`  Creating sandbox '${sandboxName}' (this takes a few minutes on first run)...`);
-  const chatUiUrl = process.env.CHAT_UI_URL || 'http://127.0.0.1:18789';
-  const envArgs = [`CHAT_UI_URL=${chatUiUrl}`];
+  const chatUiUrl = process.env.CHAT_UI_URL || `http://127.0.0.1:${chatPort}`;
+  const envArgs = [`CHAT_UI_URL=${chatUiUrl}`, `PUBLIC_PORT=${chatPort}`];
   if (process.env.NVIDIA_API_KEY) {
     envArgs.push(`NVIDIA_API_KEY=${process.env.NVIDIA_API_KEY}`);
   }
@@ -520,21 +524,18 @@ async function createSandbox(gpu) {
     process.exit(1);
   }
 
-  // Release any stale forward on port 18789 before claiming it for the new sandbox.
-  // A previous onboard run may have left the port forwarded to a different sandbox,
-  // which would silently prevent the new sandbox's dashboard from being reachable.
-  run(`openshell forward stop 18789 2>/dev/null || true`, { ignoreError: true });
-  // Forward dashboard port to the new sandbox
-  run(`openshell forward start --background 18789 "${sandboxName}"`, { ignoreError: true });
+  // Forward this sandbox's unique port — does not affect other sandboxes' forwards
+  run(`openshell forward start --background ${chatPort} "${sandboxName}"`, { ignoreError: true });
 
   // Register only after confirmed ready — prevents phantom entries
   registry.registerSandbox({
     name: sandboxName,
+    chatPort,
     gpuEnabled: !!gpu,
   });
 
   console.log(`  ✓ Sandbox '${sandboxName}' created`);
-  return sandboxName;
+  return { sandboxName, chatPort };
 }
 
 // ── Step 4: NIM ──────────────────────────────────────────────────
@@ -921,7 +922,7 @@ async function setupPolicies(sandboxName) {
 
 // ── Dashboard ────────────────────────────────────────────────────
 
-function printDashboard(sandboxName, model, provider) {
+function printDashboard(sandboxName, model, provider, chatPort) {
   const nimStat = nim.nimStatus(sandboxName);
   const nimLabel = nimStat.running ? "running" : "not running";
 
@@ -932,7 +933,7 @@ function printDashboard(sandboxName, model, provider) {
 
   console.log("");
   console.log(`  ${"─".repeat(50)}`);
-  // console.log(`  Dashboard    http://localhost:18789/`);
+  console.log(`  Dashboard    http://localhost:${chatPort || 18789}/`);
   console.log(`  Sandbox      ${sandboxName} (Landlock + seccomp + netns)`);
   console.log(`  Model        ${model} (${providerLabel})`);
   console.log(`  NIM          ${nimLabel}`);
@@ -956,12 +957,12 @@ async function onboard(opts = {}) {
 
   const gpu = await preflight();
   await startGateway(gpu);
-  const sandboxName = await createSandbox(gpu);
+  const { sandboxName, chatPort } = await createSandbox(gpu);
   const { model, provider } = await setupNim(sandboxName, gpu);
   await setupInference(sandboxName, model, provider);
   await setupOpenclaw(sandboxName, model, provider);
   await setupPolicies(sandboxName);
-  printDashboard(sandboxName, model, provider);
+  printDashboard(sandboxName, model, provider, chatPort);
 }
 
 module.exports = { buildSandboxConfigSyncScript, hasStaleGateway, isSandboxReady, onboard, setupNim };

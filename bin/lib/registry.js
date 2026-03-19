@@ -38,6 +38,21 @@ function getDefault() {
   return names.length > 0 ? names[0] : null;
 }
 
+function allocateChatPort(startPort) {
+  const base = startPort || 18789;
+  const data = load();
+  const used = new Set(
+    Object.values(data.sandboxes)
+      .map((sb) => sb.chatPort)
+      .filter(Boolean)
+  );
+  let port = base;
+  while (used.has(port)) {
+    port += 1;
+  }
+  return port;
+}
+
 function registerSandbox(entry) {
   const data = load();
   data.sandboxes[entry.name] = {
@@ -48,6 +63,7 @@ function registerSandbox(entry) {
     provider: entry.provider || null,
     gpuEnabled: entry.gpuEnabled || false,
     policies: entry.policies || [],
+    chatPort: entry.chatPort || 18789,
   };
   if (!data.defaultSandbox) {
     data.defaultSandbox = entry.name;
@@ -96,6 +112,7 @@ module.exports = {
   save,
   getSandbox,
   getDefault,
+  allocateChatPort,
   registerSandbox,
   updateSandbox,
   removeSandbox,

@@ -13,7 +13,7 @@ set -euo pipefail
 
 NEMOCLAW_CMD=("$@")
 CHAT_UI_URL="${CHAT_UI_URL:-http://127.0.0.1:18789}"
-PUBLIC_PORT=18789
+PUBLIC_PORT="${PUBLIC_PORT:-18789}"
 
 fix_openclaw_config() {
   python3 - <<'PYCFG'

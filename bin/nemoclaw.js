@@ -200,8 +200,10 @@ function listSandboxes() {
 // ── Sandbox-scoped actions ───────────────────────────────────────
 
 function sandboxConnect(sandboxName) {
-  // Ensure port forward is alive before connecting
-  run(`openshell forward start --background 18789 "${sandboxName}" 2>/dev/null || true`, { ignoreError: true });
+  // Ensure port forward is alive before connecting, using the sandbox's assigned port
+  const sb = registry.getSandbox(sandboxName);
+  const chatPort = (sb && sb.chatPort) || 18789;
+  run(`openshell forward start --background ${chatPort} "${sandboxName}" 2>/dev/null || true`, { ignoreError: true });
   runInteractive(`openshell sandbox connect "${sandboxName}"`);
 }
 
