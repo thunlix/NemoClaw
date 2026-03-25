@@ -24,6 +24,8 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 import yaml
 
@@ -70,6 +72,134 @@ def run_cmd(
 def openshell_available() -> bool:
     """Check if openshell CLI is available."""
     return shutil.which("openshell") is not None
+
+
+# ---------------------------------------------------------------------------
+# Tether integration
+# ---------------------------------------------------------------------------
+
+
+def _tether_post(endpoint: str, path: str, body: dict) -> dict | None:
+    """POST JSON to a Tether endpoint. Returns parsed response or None on failure."""
+    url = f"{endpoint.rstrip('/')}{path}"
+    data = json.dumps(body).encode()
+    req = Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+    except (URLError, OSError, json.JSONDecodeError) as exc:
+        log(f"WARNING: Tether request to {path} failed: {exc}")
+        return None
+
+
+def setup_tether(blueprint: dict[str, Any]) -> dict[str, str]:
+    """Register agent and commit intent with Tether.
+
+    Reads the tether config from the blueprint, registers the agent,
+    commits the declared intent, and returns env vars that should be
+    set on the sandbox so the Tether bridge can connect.
+
+    Returns:
+        Dict of environment variables to pass to the sandbox supervisor:
+        TETHER_ENDPOINT, TETHER_TASK_ID, TETHER_MODE.
+        Empty dict if Tether is disabled or setup fails.
+    """
+    tether_cfg = blueprint.get("components", {}).get("tether", {})
+    if not tether_cfg.get("enabled", False):
+        log("Tether: disabled in blueprint, skipping")
+        return {}
+
+    endpoint = tether_cfg.get("endpoint", "")
+    if not endpoint:
+        log("WARNING: Tether enabled but no endpoint configured, skipping")
+        return {}
+
+    agent_id = tether_cfg.get("agent_id", "nemoclaw-agent")
+    mode = tether_cfg.get("mode", "monitor")
+    intent_cfg = tether_cfg.get("intent", {})
+
+    # Step 1: Register agent (idempotent — returns existing agent if already registered)
+    log(f"Tether: registering agent '{agent_id}' at {endpoint}")
+    reg_result = _tether_post(endpoint, "/api/agents/register", {
+        "agentId": agent_id,
+        "metadata": {"source": "nemoclaw", "version": blueprint.get("version", "unknown")},
+    })
+    if reg_result is None:
+        log("WARNING: Tether agent registration failed — continuing without Tether")
+        return {}
+
+    if reg_result.get("alreadyRegistered"):
+        agent_info = reg_result.get("agent", {})
+        log(f"Tether: agent already registered (tokens={agent_info.get('tokens')}, rep={agent_info.get('reputation')})")
+    else:
+        log("Tether: agent registered successfully")
+
+    # Step 2: Commit intent — generate a unique task ID per run
+    task_id = f"nc-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    intent = {
+        "goal": intent_cfg.get("goal", "Assist user with development tasks"),
+        "constraints": intent_cfg.get("constraints", []),
+        "expectedOutputs": intent_cfg.get("expected_outputs", []),
+        "driftPolicy": intent_cfg.get("drift_policy", {"mode": "warn", "threshold": 0.7}),
+    }
+
+    log(f"Tether: committing intent for task '{task_id}'")
+    commit_result = _tether_post(endpoint, "/api/intent/commit", {
+        "agentId": agent_id,
+        "taskId": task_id,
+        "intent": intent,
+    })
+    if commit_result is None:
+        log("WARNING: Tether intent commit failed — continuing without Tether")
+        return {}
+
+    task_info = commit_result.get("task", {})
+    staked = task_info.get("stakedTokens", "?")
+    log(f"Tether: intent committed (task={task_id}, staked={staked} tokens)")
+    log(f"Tether: goal = {intent['goal']}")
+    log(f"Tether: mode = {mode}")
+
+    return {
+        "TETHER_ENDPOINT": endpoint,
+        "TETHER_TASK_ID": task_id,
+        "TETHER_MODE": mode,
+    }
+
+
+def _update_policy_tether_task_id(blueprint: dict[str, Any], task_id: str) -> None:
+    """Write the Tether task_id into the sandbox policy YAML.
+
+    The policy file's tether.task_id field starts blank in the template.
+    After intent commit, we fill it so the sandbox supervisor's Tether
+    bridge knows which task to report against.
+    """
+    blueprint_path = Path(os.environ.get("NEMOCLAW_BLUEPRINT_PATH", "."))
+    policy_base = blueprint.get("components", {}).get("policy", {}).get("base", "")
+    if not policy_base:
+        return
+
+    policy_file = blueprint_path / policy_base
+    if not policy_file.exists():
+        # Try relative to policies dir
+        policy_file = blueprint_path / "policies" / "openclaw-sandbox.yaml"
+    if not policy_file.exists():
+        log(f"WARNING: Cannot find policy file to update tether task_id")
+        return
+
+    try:
+        with policy_file.open() as f:
+            policy = yaml.safe_load(f)
+
+        if "tether" not in policy:
+            policy["tether"] = {}
+        policy["tether"]["task_id"] = task_id
+        policy["tether"]["enabled"] = True
+
+        with policy_file.open("w") as f:
+            yaml.dump(policy, f, default_flow_style=False, sort_keys=False)
+        log(f"Tether: updated policy with task_id={task_id}")
+    except Exception as exc:
+        log(f"WARNING: Failed to update policy tether task_id: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -224,8 +354,22 @@ def action_apply(
         capture=True,
     )
 
-    # Step 4: Save run state
-    progress(85, "Saving run state")
+    # Step 4: Set up Tether (behavioral drift enforcement)
+    progress(80, "Configuring Tether")
+    tether_env = setup_tether(blueprint)
+    if tether_env:
+        # Write Tether task_id back into the policy so the sandbox supervisor's
+        # bridge can read it. The policy YAML tether.task_id field was blank in
+        # the template — we fill it with the task ID generated during intent commit.
+        _update_policy_tether_task_id(blueprint, tether_env.get("TETHER_TASK_ID", ""))
+
+        # Also export as env vars so they're available to any openshell commands
+        # run in this process (e.g., policy set).
+        for key, value in tether_env.items():
+            os.environ[key] = value
+
+    # Step 5: Save run state
+    progress(90, "Saving run state")
     state_dir = Path.home() / ".nemoclaw" / "state" / "runs" / rid
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "plan.json").write_text(
@@ -235,6 +379,7 @@ def action_apply(
                 "profile": profile,
                 "sandbox_name": sandbox_name,
                 "inference": inference_cfg,
+                "tether": tether_env or None,
                 "timestamp": datetime.now(UTC).isoformat(),
             },
             indent=2,
@@ -244,6 +389,8 @@ def action_apply(
     progress(100, "Apply complete")
     log(f"Sandbox '{sandbox_name}' is ready.")
     log(f"Inference: {provider_name} -> {model} @ {endpoint}")
+    if tether_env:
+        log(f"Tether: {tether_env.get('TETHER_MODE', 'monitor')} mode, task={tether_env.get('TETHER_TASK_ID', '?')}")
 
 
 def action_status(rid: str | None = None) -> None:

@@ -7,6 +7,7 @@ exports.default = register;
 const cli_js_1 = require("./cli.js");
 const slash_js_1 = require("./commands/slash.js");
 const config_js_1 = require("./onboard/config.js");
+const tether_js_1 = require("./tether.js");
 function activeModelEntries(onboardCfg) {
     if (!onboardCfg?.model) {
         return [
@@ -103,6 +104,26 @@ function register(api) {
     const bannerEndpoint = onboardCfg ? (0, config_js_1.describeOnboardEndpoint)(onboardCfg) : "build.nvidia.com";
     const bannerProvider = onboardCfg ? (0, config_js_1.describeOnboardProvider)(onboardCfg) : "NVIDIA Cloud API";
     const bannerModel = onboardCfg?.model ?? "nvidia/nemotron-3-super-120b-a12b";
+    // 4. Register Tether hooks (behavioral drift enforcement)
+    const tetherEndpoint = process.env.TETHER_ENDPOINT || "";
+    const tetherAgentId = process.env.TETHER_AGENT_ID || "nemoclaw-agent";
+    const tetherMode = (process.env.TETHER_MODE || "monitor");
+    if (tetherEndpoint) {
+        (0, tether_js_1.initTether)({ endpoint: tetherEndpoint, agentId: tetherAgentId, mode: tetherMode }, api.logger);
+        api.on("message_received", async (event) => {
+            await (0, tether_js_1.onMessageReceived)(event);
+        });
+        api.on("before_tool_call", async (event) => {
+            return (0, tether_js_1.onBeforeToolCall)(event);
+        });
+        api.on("after_tool_call", async (event) => {
+            await (0, tether_js_1.onAfterToolCall)(event);
+        });
+        api.on("message_sent", async (event) => {
+            await (0, tether_js_1.onMessageSent)(event);
+        });
+        api.logger.info("  Tether: hooks registered (drift enforcement active)");
+    }
     api.logger.info("");
     api.logger.info("  ┌─────────────────────────────────────────────────────┐");
     api.logger.info("  │  NemoClaw registered                                │");
@@ -111,6 +132,9 @@ function register(api) {
     api.logger.info(`  │  Provider:  ${bannerProvider.padEnd(40)}│`);
     api.logger.info(`  │  Model:     ${bannerModel.padEnd(40)}│`);
     api.logger.info("  │  Commands:  openclaw nemoclaw <command>             │");
+    if (tetherEndpoint) {
+        api.logger.info(`  │  Tether:    ${tetherMode.padEnd(40)}│`);
+    }
     api.logger.info("  └─────────────────────────────────────────────────────┘");
     api.logger.info("");
 }

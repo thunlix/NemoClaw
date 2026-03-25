@@ -80,6 +80,18 @@ network_policies:
       - { path: /usr/local/bin/claude }
       - { path: /usr/local/bin/openclaw }
 
+  ollama:
+    name: ollama
+    endpoints:
+      - host: "127.0.0.1"
+        port: 11434
+        protocol: rest
+        enforcement: enforce
+        tls: passthrough
+        rules:
+          - allow: { method: "*", path: "/**" }
+    binaries: []
+
   github:
     name: github
     endpoints:
@@ -165,3 +177,33 @@ network_policies:
         rules:
           - allow: { method: GET, path: "/bot*/**" }
           - allow: { method: POST, path: "/bot*/**" }
+
+  # ── Tether — agent intent commitment ──────────────────────────
+  # Allows the agent to commit intent and pre-check actions against
+  # Tether. Activity reporting endpoints are blocked — the sandbox
+  # supervisor handles those from outside the sandbox.
+  tether_intent:
+    name: tether_intent
+    endpoints:
+      - host: "192.168.42.200"
+        port: 3002
+        protocol: rest
+        enforcement: enforce
+        tls: passthrough
+        rules:
+          - allow: { method: POST, path: "/api/intent/commit" }
+          - allow: { method: POST, path: "/api/intent/stake-floor" }
+          - allow: { method: POST, path: "/api/action/check" }
+          - allow: { method: POST, path: "/api/agents/register" }
+    binaries: []
+
+# ── Tether integration ──────────────────────────────────────────
+# Behavioral drift enforcement via Tether. The sandbox supervisor
+# reports ground-truth proxy activity to Tether and enforces verdicts.
+# Set enabled: false or remove this section to disable.
+tether:
+  enabled: true
+  endpoint: "http://192.168.42.200:3002"
+  task_id: ""           # Set by orchestrator before sandbox creation
+  mode: monitor         # "monitor" (log only) or "enforce" (act on verdicts)
+  report_interval: 30   # seconds between activity reports

@@ -484,6 +484,15 @@ async function createSandbox(gpu) {
     envArgs.push(`NVIDIA_API_KEY=${process.env.NVIDIA_API_KEY}`);
   }
 
+  // Pass Tether env vars so the plugin hooks can reach Tether from inside the sandbox
+  const tetherCfg = loadTetherConfig();
+  if (tetherCfg) {
+    envArgs.push(`TETHER_ENDPOINT=${tetherCfg.endpoint}`);
+    envArgs.push(`TETHER_MODE=${tetherCfg.mode}`);
+    envArgs.push(`TETHER_AGENT_ID=${tetherCfg.agentId}`);
+    console.log(`  Tether: ${tetherCfg.mode} mode → ${tetherCfg.endpoint}`);
+  }
+
   // Run without piping through awk — the pipe masked non-zero exit codes
   // from openshell because bash returns the status of the last pipeline
   // command (awk, always 0) unless pipefail is set. Removing the pipe
@@ -818,6 +827,152 @@ EOF_NEMOCLAW_SYNC`, { stdio: ["ignore", "ignore", "inherit"] });
   }
 
   console.log("  ✓ OpenClaw gateway launched inside sandbox");
+}
+
+// ── Tether: behavioral drift enforcement ─────────────────────────
+
+function loadTetherConfig() {
+  const blueprintPath = path.join(ROOT, "nemoclaw-blueprint", "blueprint.yaml");
+  try {
+    const yaml = fs.readFileSync(blueprintPath, "utf8");
+    // Simple YAML parse for the tether block — avoids needing a yaml dependency
+    const match = yaml.match(/^\s*tether:\s*\n((?:\s{4,}.+\n)*)/m);
+    if (!match) return null;
+    const block = match[1];
+    const get = (key) => {
+      const m = block.match(new RegExp(`^\\s*${key}:\\s*["']?([^"'\\n]+)["']?`, "m"));
+      return m ? m[1].trim() : "";
+    };
+    const enabled = get("enabled");
+    if (enabled !== "true") return null;
+    return {
+      endpoint: get("endpoint"),
+      mode: get("mode") || "monitor",
+      agentId: get("agent_id") || "nemoclaw-agent",
+    };
+  } catch {
+    return null;
+  }
+}
+
+function loadTetherIntent() {
+  const blueprintPath = path.join(ROOT, "nemoclaw-blueprint", "blueprint.yaml");
+  try {
+    const yaml = fs.readFileSync(blueprintPath, "utf8");
+    // Extract intent.goal
+    const goalMatch = yaml.match(/^\s*goal:\s*["']?(.+?)["']?\s*$/m);
+    const goal = goalMatch ? goalMatch[1] : "Assist user with development tasks";
+    // Extract constraints as array
+    const constraintsBlock = yaml.match(/constraints:\s*\n((?:\s+-\s+.+\n)*)/m);
+    const constraints = constraintsBlock
+      ? constraintsBlock[1].match(/^\s+-\s+"?(.+?)"?\s*$/gm).map(l => l.replace(/^\s+-\s+"?|"?\s*$/g, ""))
+      : [];
+    // Extract expected_outputs
+    const outputsBlock = yaml.match(/expected_outputs:\s*\n((?:\s+-\s+.+\n)*)/m);
+    const expectedOutputs = outputsBlock
+      ? outputsBlock[1].match(/^\s+-\s+"?(.+?)"?\s*$/gm).map(l => l.replace(/^\s+-\s+"?|"?\s*$/g, ""))
+      : [];
+    return { goal, constraints, expectedOutputs };
+  } catch {
+    return { goal: "Assist user with development tasks", constraints: [], expectedOutputs: [] };
+  }
+}
+
+function tetherPost(endpoint, apiPath, body) {
+  const http = require("http");
+  const url = new URL(apiPath, endpoint);
+  const data = JSON.stringify(body);
+  return new Promise((resolve) => {
+    const req = http.request(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(data) },
+      timeout: 10000,
+    }, (res) => {
+      let chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => {
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString())); }
+        catch { resolve(null); }
+      });
+    });
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => { req.destroy(); resolve(null); });
+    req.end(data);
+  });
+}
+
+async function setupTether(sandboxName) {
+  const cfg = loadTetherConfig();
+  if (!cfg) {
+    console.log("  Tether: disabled or not configured, skipping");
+    return;
+  }
+
+  console.log("");
+  console.log("  Tether — Behavioral Drift Enforcement");
+  console.log(`  ${"─".repeat(50)}`);
+  console.log(`  Endpoint: ${cfg.endpoint}`);
+  console.log(`  Mode:     ${cfg.mode}`);
+
+  // Register agent (idempotent)
+  console.log(`  Registering agent '${cfg.agentId}'...`);
+  const regResult = await tetherPost(cfg.endpoint, "/api/agents/register", {
+    agentId: cfg.agentId,
+    metadata: { source: "nemoclaw" },
+  });
+  if (!regResult) {
+    console.log("  WARNING: Tether unreachable — continuing without drift enforcement");
+    return;
+  }
+  if (regResult.alreadyRegistered) {
+    const agent = regResult.agent || {};
+    console.log(`  Agent already registered (tokens=${agent.tokens}, reputation=${agent.reputation})`);
+  } else {
+    console.log("  ✓ Agent registered");
+  }
+
+  // Commit intent
+  const taskId = `nc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const intent = loadTetherIntent();
+  console.log(`  Committing intent for task '${taskId}'...`);
+  console.log(`  Goal: ${intent.goal}`);
+
+  const commitResult = await tetherPost(cfg.endpoint, "/api/intent/commit", {
+    agentId: cfg.agentId,
+    taskId,
+    intent: {
+      goal: intent.goal,
+      constraints: intent.constraints,
+      expectedOutputs: intent.expectedOutputs,
+      driftPolicy: { mode: "block", threshold: 0.7 },
+    },
+  });
+  if (!commitResult) {
+    console.log("  WARNING: Intent commit failed — continuing without drift enforcement");
+    return;
+  }
+  const staked = (commitResult.task || {}).stakedTokens || "?";
+  console.log(`  ✓ Intent committed (staked=${staked} tokens)`);
+
+  // Inject env vars into sandbox supervisor via openshell sandbox exec
+  // These get picked up by the Tether bridge on next policy reload or restart
+  const envVars = {
+    TETHER_ENDPOINT: cfg.endpoint,
+    TETHER_TASK_ID: taskId,
+    TETHER_MODE: cfg.mode,
+  };
+  for (const [key, value] of Object.entries(envVars)) {
+    process.env[key] = value;
+  }
+
+  // Write a tether env file into the sandbox for the supervisor to source
+  const envLines = Object.entries(envVars).map(([k, v]) => `${k}=${v}`).join("\\n");
+  run(
+    `printf '${envLines}\\n' | openshell sandbox exec "${sandboxName}" -- sh -c 'cat > /tmp/tether.env'`,
+    { ignoreError: true }
+  );
+
+  console.log(`  ✓ Tether configured (task=${taskId}, mode=${cfg.mode})`);
 }
 
 // ── Step 7: Policy presets ───────────────────────────────────────

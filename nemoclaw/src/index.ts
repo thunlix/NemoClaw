@@ -19,6 +19,13 @@ import {
   describeOnboardProvider,
   loadOnboardConfig,
 } from "./onboard/config.js";
+import {
+  initTether,
+  onMessageReceived,
+  onBeforeToolCall,
+  onAfterToolCall,
+  onMessageSent,
+} from "./tether.js";
 
 // ---------------------------------------------------------------------------
 // OpenClaw Plugin SDK compatible types (mirrors openclaw/plugin-sdk)
@@ -265,6 +272,39 @@ export default function register(api: OpenClawPluginApi): void {
   const bannerProvider = onboardCfg ? describeOnboardProvider(onboardCfg) : "NVIDIA Cloud API";
   const bannerModel = onboardCfg?.model ?? "nvidia/nemotron-3-super-120b-a12b";
 
+  // 4. Register Tether hooks (behavioral drift enforcement)
+  const tetherEndpoint = process.env.TETHER_ENDPOINT || "";
+  const tetherAgentId = process.env.TETHER_AGENT_ID || "nemoclaw-agent";
+  const tetherMode = (process.env.TETHER_MODE || "monitor") as "enforce" | "monitor";
+
+  if (tetherEndpoint) {
+    initTether({ endpoint: tetherEndpoint, agentId: tetherAgentId, mode: tetherMode }, api.logger);
+
+    api.on("message_received", async (event) => {
+      await onMessageReceived(event as { content: string });
+    });
+
+    api.on("before_tool_call", async (event) => {
+      return onBeforeToolCall(event as { toolName: string; params: Record<string, unknown> });
+    });
+
+    api.on("after_tool_call", async (event) => {
+      await onAfterToolCall(event as {
+        toolName: string;
+        params: Record<string, unknown>;
+        result?: unknown;
+        error?: string;
+        durationMs?: number;
+      });
+    });
+
+    api.on("message_sent", async (event) => {
+      await onMessageSent(event as { content: string; success: boolean });
+    });
+
+    api.logger.info("  Tether: hooks registered (drift enforcement active)");
+  }
+
   api.logger.info("");
   api.logger.info("  ┌─────────────────────────────────────────────────────┐");
   api.logger.info("  │  NemoClaw registered                                │");
@@ -273,6 +313,9 @@ export default function register(api: OpenClawPluginApi): void {
   api.logger.info(`  │  Provider:  ${bannerProvider.padEnd(40)}│`);
   api.logger.info(`  │  Model:     ${bannerModel.padEnd(40)}│`);
   api.logger.info("  │  Commands:  openclaw nemoclaw <command>             │");
+  if (tetherEndpoint) {
+    api.logger.info(`  │  Tether:    ${tetherMode.padEnd(40)}│`);
+  }
   api.logger.info("  └─────────────────────────────────────────────────────┘");
   api.logger.info("");
 }

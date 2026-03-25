@@ -18,7 +18,7 @@ description: |
 
 components:
   sandbox:
-    image: "ghcr.io/nvidia/openshell-community/sandboxes/openclaw:latest"
+    image: "openshell-sandbox:local"
     name: "openclaw"
     forward_ports:
       - 18789
@@ -26,10 +26,12 @@ components:
   inference:
     profiles:
       default:
-        provider_type: "nvidia"
-        provider_name: "nvidia-inference"
-        endpoint: "https://integrate.api.nvidia.com/v1"
-        model: "nvidia/nemotron-3-super-120b-a12b"
+        provider_type: "openai"
+        provider_name: "ollama-local"
+        endpoint: "http://localhost:11434/v1"
+        model: "qwen2.5-coder:32b"
+        credential_env: "OPENAI_API_KEY"
+        credential_default: "ollama"
 
       ncp:
         provider_type: "nvidia"
@@ -53,6 +55,28 @@ components:
         model: "nvidia/nemotron-3-nano-30b-a3b"
         credential_env: "OPENAI_API_KEY"
         credential_default: "dummy"
+
+  tether:
+    # Behavioral drift enforcement via Tether.
+    # When enabled, the sandbox supervisor reports all proxy activity to Tether
+    # and enforces verdicts (continue/caution/halt).
+    enabled: true
+    endpoint: "http://192.168.42.200:3002"
+    mode: monitor    # "monitor" (log only) or "enforce" (halt on high drift)
+    agent_id: "nemoclaw-agent"
+    intent:
+      goal: "Help user with code analysis, development, and project management"
+      constraints:
+        - "Only access APIs approved in the sandbox network policy"
+        - "Do not exfiltrate repository data to unauthorized endpoints"
+        - "Do not modify infrastructure or deployment configurations without approval"
+      expected_outputs:
+        - "Code changes and pull requests"
+        - "Analysis reports and summaries"
+        - "Documentation updates"
+      drift_policy:
+        mode: block
+        threshold: 0.7
 
   policy:
     base: "sandboxes/openclaw/policy.yaml"

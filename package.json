@@ -11,7 +11,8 @@
     "prepublishOnly": "cd nemoclaw && npm install --ignore-scripts && npm run build"
   },
   "dependencies": {
-    "openclaw": "2026.3.11"
+    "openclaw": "2026.3.11",
+    "openshell": "^0.1.0"
   },
   "files": [
     "bin/",
